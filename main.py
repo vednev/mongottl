@@ -9,12 +9,18 @@ cluster health signals sampled each cycle.
 
 Hard stop signals (skip run entirely):
   - Replication lag exceeds 200s on any secondary
-  - Write ticket utilization >= 90% or no tickets available
   - Write queue depth > 0
 
-Gradual scaling signals (batch size scaled down linearly, take max):
-  - Write ticket utilization: scale down from 70% toward 90%
-  - Dirty cache ratio:        scale down from 55% toward 85%
+Gradual scaling signals (batch size scaled down linearly):
+  - Dirty cache ratio: scale down from 10% toward 20%
+
+Topology:
+  - Replica set: metrics sampled directly from the primary via serverStatus
+    and replSetGetStatus.
+  - Sharded cluster: metrics sampled by connecting directly to each shard
+    primary using the same URI credentials. Requires the user to have the
+    directShardOperations role. Only shards relevant to the query are sampled
+    (resolved via explain()). Worst value across shards governs throttling.
 
 Batch size is capped to the number of currently eligible documents.
 
@@ -26,6 +32,10 @@ Usage:
         --field createdAt \
         --ttl   31556952 \
         [--max-batch 1000] \
+        [--interval 60] \
+        [--repl-lag-hard-stop 200] \
+        [--dirty-scale-start 0.10] \
+        [--dirty-hard-stop 0.20] \
         [--dry-run]
 """
 
@@ -33,6 +43,7 @@ import argparse
 import logging
 import time
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 from pymongo import ASCENDING, MongoClient, WriteConcern
 
@@ -44,20 +55,117 @@ logging.basicConfig(
 )
 log = logging.getLogger("deleter")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-RUN_INTERVAL_MAX_SEC = 60  # sleep interval when cluster is under pressure
-RUN_INTERVAL_MIN_SEC = 10  # sleep interval when cluster is very healthy
-
-REPL_LAG_HARD_STOP_SEC = 200  # replication lag threshold for hard stop
-
-TICKET_SCALE_START = 0.70  # begin scaling batch down at this ticket utilization
-TICKET_HARD_STOP = 0.90  # hard stop at this ticket utilization
-
-DIRTY_SCALE_START = 0.55  # begin scaling batch down at this dirty cache ratio
-DIRTY_HARD_STOP = 0.85  # hard stop at this dirty cache ratio (soft — via scale)
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _is_mongos(admin) -> bool:
+    """Returns True if the connected node is a mongos (sharded cluster router)."""
+    try:
+        result = admin.command("hello")
+        return result.get("msg") == "isdbgrid"
+    except Exception:
+        return False
+
+
+def _shard_admin_clients(
+    client: MongoClient, uri: str, shard_ids: set | None = None
+) -> list:
+    """
+    Returns a list of (shard_id, MongoClient) for each shard primary in the
+    cluster. Connects directly to each shard using directConnection=True, which
+    requires the directShardOperations role.
+
+    Credentials and TLS settings are taken from the original URI so that Atlas
+    and other authenticated deployments work correctly.
+
+    If shard_ids is provided, only connects to those shards.
+    """
+    shards = client.admin.command("listShards").get("shards", [])
+    clients = []
+    for shard in shards:
+        if shard_ids is not None and shard["_id"] not in shard_ids:
+            continue
+        # host field is "replicaSetName/host1:port,host2:port,..."
+        # With directConnection=True we target the first listed host directly.
+        # Rebuild the URI swapping in the shard host to carry credentials/TLS.
+        host = shard["host"]
+        hosts = host.split("/", 1)[1] if "/" in host else host
+        primary_host = hosts.split(",")[0]
+
+        parsed = urlparse(uri)
+        qs = parse_qs(parsed.query)
+
+        # Build kwargs from the original URI so credentials and TLS carry over.
+        # Always use mongodb:// for direct shard connections — mongodb+srv://
+        # does DNS-based resolution and does not support direct host overrides.
+        kwargs: dict = {"directConnection": True, "serverSelectionTimeoutMS": 5_000}
+        if parsed.username:
+            kwargs["username"] = parsed.username
+        if parsed.password:
+            kwargs["password"] = parsed.password
+        auth_source = qs.get("authSource", [None])[0]
+        if auth_source:
+            kwargs["authSource"] = auth_source
+        auth_mech = qs.get("authMechanism", [None])[0]
+        if auth_mech:
+            kwargs["authMechanism"] = auth_mech
+        kwargs["tls"] = True
+
+        try:
+            c = MongoClient(f"mongodb://{primary_host}/", **kwargs)
+            c.admin.command("ping")
+            clients.append((shard["_id"], c))
+        except Exception as e:
+            log.warning("Could not connect to shard %s: %s", shard["_id"], e)
+    return clients
+
+
+def _resolve_query_shards(coll, query: dict, field: str) -> set | None:
+    """
+    Runs explain() on the aggregation pipeline against the collection and
+    returns the set of shard names the query will be routed to.
+
+    Returns None if explain fails or the collection is unsharded, in which
+    case the caller falls back to sampling all shards.
+    """
+    try:
+        pipeline = [
+            {"$match": query},
+            {"$sort": {field: ASCENDING}},
+            {"$limit": 1},
+            {"$project": {"_id": 1}},
+        ]
+        explained_doc = coll.database.command(
+            "explain",
+            {"aggregate": coll.name, "pipeline": pipeline, "cursor": {}},
+            verbosity="queryPlanner",
+        )
+
+        def _find_shards(obj):
+            if isinstance(obj, dict):
+                if "shards" in obj and isinstance(obj["shards"], list):
+                    return obj["shards"]
+                for v in obj.values():
+                    result = _find_shards(v)
+                    if result:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = _find_shards(item)
+                    if result:
+                        return result
+            return None
+
+        shards = _find_shards(explained_doc)
+        if shards:
+            shard_ids = {s.get("shardName") or s.get("shard") for s in shards}
+            shard_ids.discard(None)
+            if shard_ids:
+                log.info("Query routes to shards: %s", sorted(shard_ids))
+                return shard_ids
+    except Exception as e:
+        log.warning("explain() failed: %s — will sample all shards.", e)
+    return None
 
 
 def _repl_lag_seconds(admin) -> float:
@@ -75,7 +183,7 @@ def _repl_lag_seconds(admin) -> float:
     for member in status.get("members", []):
         if member.get("stateStr") == "PRIMARY":
             primary_date = member.get("optimeDate")
-        else:
+        elif member.get("stateStr") == "SECONDARY":
             d = member.get("optimeDate")
             if d is not None:
                 member_dates.append(d)
@@ -83,68 +191,70 @@ def _repl_lag_seconds(admin) -> float:
     if primary_date is None or not member_dates:
         return 0.0
 
-    return max((primary_date - d).total_seconds() for d in member_dates)
+    # Clamp to zero — negative values indicate minor clock skew between nodes.
+    return max(0.0, max((primary_date - d).total_seconds() for d in member_dates))
 
 
-def sample_cluster_utilization(admin, db) -> tuple[float, bool]:
+def _node_metrics(shard_id: str, admin) -> dict:
     """
-    Samples cluster health and returns (util, hard_stop) where:
-
-      util       — 0.0–1.0 scaling score, the max of:
-                     - Write ticket utilization: tickets_in_use / total_tickets
-                     - Dirty cache ratio: dirty_bytes / max_cache_bytes
-                   Governs linear batch size scaling.
-
-      hard_stop  — True if any of the following are active:
-                     - Replication lag > REPL_LAG_HARD_STOP_SEC on any secondary
-                     - Write ticket utilization >= TICKET_HARD_STOP
-                     - No write tickets available
-                     - Write queue depth > 0
-                   Causes the run to be skipped entirely.
-
-    Signals logged per cycle:
-      repl_lag, ticket_util, write_queue_depth, dirty_util
+    Samples serverStatus and replSetGetStatus from a single mongod and returns
+    a dict with: repl_lag, write_queue, dirty_util.
     """
-    status = db.command("serverStatus")
+    status = admin.command("serverStatus")
 
-    # ── Replication lag ───────────────────────────────────────────────────────
-    repl_lag = _repl_lag_seconds(db.client.admin)
+    repl_lag = _repl_lag_seconds(admin)
+    write_queue = status["queues"]["execution"]["write"]["normalPriority"][
+        "queueLength"
+    ]
 
-    # ── Write ticket utilization ──────────────────────────────────────────────
-    wt = status["queues"]["execution"]["write"]
-    tickets_out = wt["out"]
-    tickets_total = wt["totalTickets"]
-    tickets_avail = wt["available"]
-    ticket_util = tickets_out / tickets_total if tickets_total > 0 else 1.0
-
-    # ── Write queue depth ─────────────────────────────────────────────────────
-    write_queue = wt["normalPriority"]["queueLength"]
-
-    # ── Dirty cache ratio ─────────────────────────────────────────────────────
     cache = status["wiredTiger"]["cache"]
+    cache_used = cache["bytes currently in the cache"]
     dirty_util = (
-        cache["tracked dirty bytes in the cache"] / cache["maximum bytes configured"]
+        cache["tracked dirty bytes in the cache"] / cache_used
+        if cache_used > 0
+        else 0.0
     )
 
     log.info(
-        "Repl lag: %.1fs  |  Tickets: %d/%d (%.1f%%)  |  Write queue: %d  |  Dirty cache: %.1f%%",
+        "[%s]  Repl lag: %.1fs  |  Write queue: %d  |  Dirty cache: %.1f%%",
+        shard_id,
         repl_lag,
-        tickets_out,
-        tickets_total,
-        ticket_util * 100,
         write_queue,
         dirty_util * 100,
     )
 
-    hard_stop = (
-        repl_lag > REPL_LAG_HARD_STOP_SEC
-        or ticket_util >= TICKET_HARD_STOP
-        or tickets_avail == 0
-        or write_queue > 0
-    )
+    return {
+        "repl_lag": repl_lag,
+        "write_queue": write_queue,
+        "dirty_util": dirty_util,
+    }
 
-    # Scaling util is the max of the two gradual signals, each normalized to
-    # their own scale range so they are comparable on a 0–1 axis.
+
+def sample_cluster_utilization(
+    client: MongoClient,
+    uri: str,
+    repl_lag_hard_stop: float,
+    dirty_scale_start: float,
+    dirty_hard_stop: float,
+    shard_ids: set | None = None,
+) -> tuple[float, bool]:
+    """
+    Samples cluster health and returns (util, hard_stop).
+
+    Topology is detected automatically:
+      - Replica set / standalone: samples the primary via serverStatus and
+        replSetGetStatus.
+      - Sharded cluster (mongos): connects directly to each relevant shard
+        primary (requires directShardOperations role) and samples the same
+        metrics. Worst value across all sampled shards governs decisions.
+
+      util       — 0.0–1.0 scaling score derived from dirty cache ratio.
+
+      hard_stop  — True if on any sampled node:
+                     - Replication lag > repl_lag_hard_stop
+                     - Write queue depth > 0
+    """
+
     def _normalize(val: float, start: float, stop: float) -> float:
         if val <= start:
             return 0.0
@@ -152,26 +262,40 @@ def sample_cluster_utilization(admin, db) -> tuple[float, bool]:
             return 1.0
         return (val - start) / (stop - start)
 
-    util = max(
-        _normalize(ticket_util, TICKET_SCALE_START, TICKET_HARD_STOP),
-        _normalize(dirty_util, DIRTY_SCALE_START, DIRTY_HARD_STOP),
-    )
+    if _is_mongos(client.admin):
+        # ── Sharded: connect directly to each relevant shard primary ──────────
+        shard_clients = _shard_admin_clients(client, uri, shard_ids=shard_ids)
+        if not shard_clients:
+            log.warning("No shard primaries reachable — skipping on safety.")
+            return 1.0, True
+
+        all_metrics = []
+        for shard_id, sc in shard_clients:
+            try:
+                all_metrics.append(_node_metrics(shard_id, sc.admin))
+            except Exception as e:
+                log.warning(
+                    "Failed to sample shard %s: %s — treating as hard stop.",
+                    shard_id,
+                    e,
+                )
+                return 1.0, True
+            finally:
+                sc.close()
+    else:
+        # ── Replica set / standalone: sample the primary directly ─────────────
+        all_metrics = [_node_metrics("primary", client.admin)]
+
+    # Take the worst value across all sampled nodes
+    repl_lag = max(m["repl_lag"] for m in all_metrics)
+    write_queue = max(m["write_queue"] for m in all_metrics)
+    dirty_util = max(m["dirty_util"] for m in all_metrics)
+
+    hard_stop = repl_lag > repl_lag_hard_stop or write_queue > 0
+
+    util = _normalize(dirty_util, dirty_scale_start, dirty_hard_stop)
 
     return util, hard_stop
-
-
-def compute_sleep_interval(util: float, hard_stop: bool) -> float:
-    """
-    Returns the post-work sleep interval for this cycle.
-
-    When the cluster is healthy (util == 0.0, no hard stop), sleeps for
-    RUN_INTERVAL_MIN_SEC so backlogs clear faster. Scales up linearly to
-    RUN_INTERVAL_MAX_SEC as util approaches 1.0 or on any hard stop.
-    """
-    if hard_stop or util >= 1.0:
-        return RUN_INTERVAL_MAX_SEC
-
-    return RUN_INTERVAL_MIN_SEC + util * (RUN_INTERVAL_MAX_SEC - RUN_INTERVAL_MIN_SEC)
 
 
 def compute_batch_size(max_batch: int, util: float) -> int:
@@ -183,29 +307,6 @@ def compute_batch_size(max_batch: int, util: float) -> int:
     goes from 0 to 1. Hard stops are handled before this is called.
     """
     return max(0, int(max_batch * (1.0 - util)))
-
-
-def eligible_time_range(coll, field: str, cutoff: datetime):
-    """
-    Returns (min_time, max_time, total_count) for documents eligible for
-    deletion. min/max are None if no documents qualify.
-    """
-    pipeline = [
-        {"$match": {field: {"$lte": cutoff}}},
-        {
-            "$group": {
-                "_id": None,
-                "min_t": {"$min": f"${field}"},
-                "max_t": {"$max": f"${field}"},
-                "count": {"$sum": 1},
-            }
-        },
-    ]
-    result = list(coll.aggregate(pipeline))
-    if not result:
-        return None, None, 0
-    r = result[0]
-    return r["min_t"], r["max_t"], r["count"]
 
 
 # ── Main service loop ─────────────────────────────────────────────────────────
@@ -222,89 +323,76 @@ def run(args: argparse.Namespace) -> None:
     while True:
         cycle_start = time.monotonic()
 
+        # ── Determine eligibility window ──────────────────────────────────────
+        cutoff = datetime.fromtimestamp(
+            datetime.now(tz=timezone.utc).timestamp() - args.ttl,
+            tz=timezone.utc,
+        )
+
+        # ── Resolve which shards the query touches (sharded clusters only) ────
+        query = {args.field: {"$lte": cutoff}}
+        shard_ids = (
+            _resolve_query_shards(coll, query, args.field)
+            if _is_mongos(client.admin)
+            else None
+        )
+
         # ── Sample cluster utilization ────────────────────────────────────────
-        util, hard_stop = sample_cluster_utilization(client.admin, db)
+        util, hard_stop = sample_cluster_utilization(
+            client,
+            uri=args.uri,
+            repl_lag_hard_stop=args.repl_lag_hard_stop,
+            dirty_scale_start=args.dirty_scale_start,
+            dirty_hard_stop=args.dirty_hard_stop,
+            shard_ids=shard_ids,
+        )
 
         if hard_stop:
             log.warning("Hard stop signal active — skipping run.")
         else:
-            # ── Determine eligibility window ──────────────────────────────────
-            cutoff = datetime.fromtimestamp(
-                datetime.now(tz=timezone.utc).timestamp() - args.ttl,
-                tz=timezone.utc,
-            )
+            # ── Compute batch size ────────────────────────────────────────────
+            batch_size = compute_batch_size(args.max_batch, util)
 
-            min_t, max_t, total_eligible = eligible_time_range(coll, args.field, cutoff)
-
-            if total_eligible == 0:
-                log.info("No expired documents found — sleeping.")
+            if batch_size == 0:
+                log.warning("Utilisation too high (%.1f%%) — skipping run.", util * 100)
             else:
-                log.info(
-                    "Eligible: %d docs  |  oldest: %s  |  newest: %s",
-                    total_eligible,
-                    min_t,
-                    max_t,
-                )
-
-                # ── Compute batch size ────────────────────────────────────────
-                batch_size = compute_batch_size(args.max_batch, util)
-
-                # Never attempt more docs than actually exist
-                batch_size = min(batch_size, total_eligible)
-
                 log.info("Effective batch: %d", batch_size)
 
-                if batch_size == 0:
-                    log.warning(
-                        "utilization too high (%.1f%%) — skipping run.", util * 100
+                # ── Fetch eligible IDs then delete ────────────────────────────
+                # Aggregation pipeline: $match → $sort → $limit → $project.
+                pipeline = [
+                    {"$match": query},
+                    {"$sort": {args.field: ASCENDING}},
+                    {"$limit": batch_size},
+                    {"$project": {"_id": 1}},
+                ]
+                ids = [doc["_id"] for doc in coll.aggregate(pipeline)]
+
+                if not ids:
+                    log.info("No expired documents found — sleeping.")
+                elif args.dry_run:
+                    log.info(
+                        "[DRY-RUN] Would delete %d docs  |  oldest _id: %s  |  newest _id: %s",
+                        len(ids),
+                        ids[0],
+                        ids[-1],
                     )
                 else:
-                    # ── Fetch eligible IDs then delete ────────────────────────
-                    # Collect up to batch_size _ids sorted by the TTL field
-                    # ascending (oldest first), then issue a single delete_many
-                    # keyed on those exact IDs.
-                    query = {args.field: {"$lte": cutoff}}
-                    ids = [
-                        doc["_id"]
-                        for doc in coll.find(query, {"_id": 1})
-                        .sort(args.field, ASCENDING)
-                        .limit(batch_size)
-                    ]
-
-                    if args.dry_run:
-                        deleted = len(ids)
-                        log.info(
-                            "[DRY-RUN] Would delete %d docs  |  oldest _id: %s  |  newest _id: %s",
-                            deleted,
-                            ids[0],
-                            ids[-1],
-                        )
-                    else:
-                        delete_start = time.monotonic()
-                        result = coll.delete_many({"_id": {"$in": ids}})
-                        deleted = result.deleted_count
-                        log.info(
-                            "Deleted %d docs in %.1fs  |  oldest _id: %s  |  newest _id: %s",
-                            deleted,
-                            time.monotonic() - delete_start,
-                            ids[0],
-                            ids[-1],
-                        )
-
-                    remaining = total_eligible - deleted
-                    if remaining > 0:
-                        log.info("%d docs remain — queued for next run.", remaining)
+                    delete_start = time.monotonic()
+                    result = coll.delete_many({"_id": {"$in": ids}})
+                    deleted = result.deleted_count
+                    log.info(
+                        "Deleted %d docs in %.1fs  |  oldest _id: %s  |  newest _id: %s",
+                        deleted,
+                        time.monotonic() - delete_start,
+                        ids[0],
+                        ids[-1],
+                    )
 
         # ── Sleep after work completes ────────────────────────────────────────
-        interval = compute_sleep_interval(util, hard_stop)
         elapsed = time.monotonic() - cycle_start
-        log.info(
-            "Run took %.1fs — sleeping %.1fs (interval %.0fs).\n",
-            elapsed,
-            interval,
-            interval,
-        )
-        time.sleep(interval)
+        log.info("Run took %.1fs — sleeping %.0fs.\n", elapsed, args.interval)
+        time.sleep(args.interval)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -325,12 +413,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Retention period in seconds (docs older than this are deleted)",
     )
-
     p.add_argument(
         "--max-batch",
         default=1_000,
         type=int,
         help="Upper bound on documents deleted per run",
+    )
+    p.add_argument(
+        "--interval",
+        default=60,
+        type=float,
+        help="Fixed sleep interval in seconds after each run",
+    )
+    p.add_argument(
+        "--repl-lag-hard-stop",
+        default=200,
+        type=float,
+        help="Replication lag in seconds that triggers a hard stop",
+    )
+    p.add_argument(
+        "--dirty-scale-start",
+        default=0.10,
+        type=float,
+        help="Dirty cache ratio at which batch scaling begins (0–1)",
+    )
+    p.add_argument(
+        "--dirty-hard-stop",
+        default=0.20,
+        type=float,
+        help="Dirty cache ratio at which batch scaling reaches zero (0–1)",
     )
     p.add_argument(
         "--dry-run",
