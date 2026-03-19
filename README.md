@@ -1,6 +1,6 @@
 # MongoDB Batch Deleter
 
-TTL-style batch delete service for MongoDB. Deletes one batch of expired documents per invocation, throttling the batch size based on real-time cluster health signals. Scheduling is left entirely to the caller.
+TTL-style batch delete service for MongoDB. Runs continuously in default mode, deleting one batch of expired documents per cycle and sleeping between runs. Throttles the batch size based on real-time cluster health signals.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 ### Default mode
 
-Reads config from CLI arguments, connects using `--uri`, runs one delete cycle, and exits. The caller is responsible for scheduling (cron, systemd timer, etc.).
+Reads config from CLI arguments, connects using `--uri`, and runs continuously — executing one delete cycle then sleeping for `--interval` seconds before the next. Runs until the process is stopped.
 
 ```
 python main.py \
@@ -27,6 +27,7 @@ python main.py \
     --coll      mycoll \
     --field     createdAt \
     --ttl       2592000 \
+    [--interval 60] \
     [--max-batch 1000] \
     [--repl-lag-hard-stop 200] \
     [--dirty-scale-start 0.10] \
@@ -34,13 +35,12 @@ python main.py \
     [--atlas-group-id <id>] \
     [--atlas-public-key <key>] \
     [--atlas-private-key <key>] \
-    [--atlas-cluster-name <name>] \
     [--dry-run]
 ```
 
 ### Lambda mode
 
-Reads config from environment variables, fetches the MongoDB URI from AWS Secrets Manager (cached after the first call), and runs one delete cycle. The `handler(event, context)` function is the Lambda entry point.
+Reads config from environment variables, fetches the MongoDB URI from AWS Secrets Manager (cached after the first call), and runs one delete cycle per invocation. The `handler(event, context)` function is the Lambda entry point. Scheduling is handled externally by EventBridge — `--interval` is not used.
 
 Pass `--lambda` on the CLI to invoke the Lambda code path locally for testing:
 
@@ -62,6 +62,7 @@ python main.py --lambda
 | `--coll` | yes | — | Collection name |
 | `--field` | yes | — | Date field used to determine document age |
 | `--ttl` | yes | — | Retention period in seconds. Documents older than this are eligible for deletion. |
+| `--interval` | no | `60` | Seconds to sleep between runs. |
 | `--max-batch` | no | `1000` | Maximum number of documents to delete per run. |
 | `--repl-lag-hard-stop` | no | `200` | Replication lag in seconds that triggers a hard stop. |
 | `--dirty-scale-start` | no | `0.10` | Dirty cache ratio (0–1) at which batch scaling begins. |
@@ -69,7 +70,6 @@ python main.py --lambda
 | `--atlas-group-id` | no* | — | Atlas project Group ID. *Required for sharded Atlas clusters. |
 | `--atlas-public-key` | no* | — | Atlas API public key (HTTP Digest auth). *Required for sharded clusters. |
 | `--atlas-private-key` | no* | — | Atlas API private key (HTTP Digest auth). *Required for sharded clusters. |
-| `--atlas-cluster-name` | no* | — | Atlas cluster name. *Required for sharded clusters. |
 | `--dry-run` | no | `false` | Log what would be deleted without actually deleting. |
 
 ## How it works
@@ -117,7 +117,7 @@ Metrics sampled directly from the primary via `serverStatus` and `replSetGetStat
 
 Metrics fetched from the Atlas Admin API (`--atlas-*` args required). No direct shard connections are made; the `directShardOperations` role is not required.
 
-Processes belonging to the cluster are identified by `replicaSetName` containing `--atlas-cluster-name` (e.g. `MyCluster-shard-0`) or `shardName` matching it exactly. The worst metric value across all processes governs throttling.
+All data-bearing shard processes in the Atlas project group are sampled. Routers (`SHARD_MONGOS`) and config server nodes are excluded. The worst metric value across all sampled processes governs throttling.
 
 ## Notes
 

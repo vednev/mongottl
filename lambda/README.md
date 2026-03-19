@@ -10,16 +10,16 @@ The same `main.py` used for the long-running service also serves as the Lambda e
 |---|---|---|
 | Config source | CLI arguments | Environment variables |
 | MongoDB URI | `--uri` flag | Fetched from Secrets Manager (`MONGO_SECRET_NAME`) |
-| MongoClient | Created fresh each run | Cached across warm invocations |
-| Scheduling | Caller's responsibility | EventBridge scheduled rule |
-| Return value | Logs result and exits | Returns result dict to Lambda runtime |
+| MongoClient | Created fresh on start, reused across cycles | Cached across warm invocations |
+| Scheduling | Built-in loop via `--interval` (default 60s) | EventBridge scheduled rule |
+| Return value | Logs result, sleeps, repeats | Returns result dict to Lambda runtime |
 
 ---
 
 ## Prerequisites
 
 - Python 3.11+ Lambda runtime
-- An Atlas project Group ID, public key, private key, and cluster name (sharded clusters only)
+- An Atlas project Group ID, public key, and private key (sharded clusters only)
 - Your MongoDB URI stored in AWS Secrets Manager as:
   ```json
   { "uri": "mongodb+srv://user:pass@cluster.mongodb.net" }
@@ -99,7 +99,8 @@ aws lambda create-function \
         "MONGO_MAX_BATCH":            "1000",
         "MONGO_REPL_LAG_HARD_STOP":   "200",
         "MONGO_DIRTY_SCALE_START":    "0.10",
-        "MONGO_DIRTY_HARD_STOP":      "0.20"
+        "MONGO_DIRTY_HARD_STOP":      "0.20",
+        "MONGO_DRY_RUN":              "true/false"
     }'
 ```
 
@@ -113,7 +114,6 @@ aws lambda update-function-configuration \
         "ATLAS_GROUP_ID":      "<24-hex-project-id>",
         "ATLAS_PUBLIC_KEY":    "<public-key>",
         "ATLAS_PRIVATE_KEY":   "<private-key>",
-        "ATLAS_CLUSTER_NAME":  "<cluster-name>"
     }'
 ```
 
@@ -151,7 +151,6 @@ aws events put-targets \
 | `ATLAS_GROUP_ID` | sharded only | — | Atlas project Group ID |
 | `ATLAS_PUBLIC_KEY` | sharded only | — | Atlas API public key |
 | `ATLAS_PRIVATE_KEY` | sharded only | — | Atlas API private key |
-| `ATLAS_CLUSTER_NAME` | sharded only | — | Atlas cluster name |
 | `MONGO_MAX_BATCH` | no | `1000` | Max documents to delete per invocation |
 | `MONGO_REPL_LAG_HARD_STOP` | no | `200` | Replication lag in seconds that triggers a hard stop |
 | `MONGO_DIRTY_SCALE_START` | no | `0.10` | Dirty cache ratio at which batch scaling begins |
