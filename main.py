@@ -24,11 +24,12 @@ Topology:
     HTTP Digest auth (public key + private key).
 
 Modes:
-  Default  — reads config from CLI args, connects using --uri, runs one cycle, exits.
+  Default  — reads config from CLI args, connects using --uri, and runs continuously,
+             sleeping --interval seconds between cycles.
   --lambda — reads config from environment variables, fetches the MongoDB URI
              from AWS Secrets Manager, caches the MongoClient across warm
              invocations, and exposes a handler(event, context) entry point
-             for AWS Lambda / EventBridge.
+             for AWS Lambda / EventBridge. Runs one cycle per invocation.
 
 Usage (default):
     python main.py \\
@@ -112,6 +113,7 @@ def _get_lambda_uri() -> str:
         sm = boto3.client("secretsmanager", region_name=region)
         secret = sm.get_secret_value(SecretId=secret_name)
         _lambda_mongo_uri = json.loads(secret["SecretString"])["uri"]
+    assert _lambda_mongo_uri is not None
     return _lambda_mongo_uri
 
 
@@ -204,7 +206,7 @@ def _atlas_node_metrics(
     measurements = raw_data.get("measurements", [])
     proc_values = {m: _latest_value(measurements, m) for m in metrics_to_fetch}
 
-    repl_lag = proc_values.get("OPLOG_REPLICATION_LAG") or 0.0
+    repl_lag = max(0.0, proc_values.get("OPLOG_REPLICATION_LAG") or 0.0)
     write_queue = proc_values.get("GLOBAL_LOCK_CURRENT_QUEUE_WRITERS") or 0.0
     dirty_util = (proc_values.get("DIRTY_FILL_RATIO") or 0.0) / 100.0
 
@@ -237,7 +239,12 @@ def _atlas_node_metrics(
             if daily_points:
                 disk_queue_current = daily_points[-1]
                 disk_queue_daily_max = max(daily_points)
-                disk_queue_hard_stop = disk_queue_current >= disk_queue_daily_max
+                # Only hard-stop if there is actual queue pressure; avoid
+                # triggering when both current and daily_max are 0.0.
+                disk_queue_hard_stop = (
+                    disk_queue_current > 0
+                    and disk_queue_current >= disk_queue_daily_max
+                )
     except Exception as e:
         log.warning(
             "[%s]  Could not fetch disk queue depth: %s. Skipping disk check.",
@@ -371,9 +378,9 @@ def sample_cluster_utilization(
                 f"Sharded cluster detected but Atlas API arguments are missing: {', '.join(missing)}"
             )
 
-        group_id_ = atlas_group_id
-        pub_key_ = atlas_public_key
-        priv_key_ = atlas_private_key
+        group_id_: str = atlas_group_id  # type: ignore[assignment]
+        pub_key_: str = atlas_public_key  # type: ignore[assignment]
+        priv_key_: str = atlas_private_key  # type: ignore[assignment]
 
         try:
             all_processes = _atlas_list_processes(group_id_, pub_key_, priv_key_)
@@ -381,8 +388,9 @@ def sample_cluster_utilization(
             log.warning("Could not list Atlas processes: %s — hard stop on safety.", e)
             return 1.0, True, 0.0
 
-        # Exclude routers; only sample data-bearing shard nodes.
-        _EXCLUDED_TYPES = { "SHARD_MONGOS" }
+        # Exclude routers and config server nodes; only sample data-bearing shard nodes.
+        # SHARD_CONFIG_* nodes are excluded because their metrics endpoint returns 404.
+        _EXCLUDED_TYPES = [ "SHARD_MONGOS" ]
         cluster_processes = [
             p for p in all_processes if p.get("typeName", "") not in _EXCLUDED_TYPES
         ]
@@ -548,7 +556,11 @@ def run_once(
     )
     cutoff = datetime.now(tz=timezone.utc) - timedelta(seconds=ttl)
     query = {field: {"$lte": cutoff}}
-    pipeline = [
+
+    # Used only for explain() inside sample_cluster_utilization to determine
+    # which shards the query touches. The limit here doesn't affect shard
+    # targeting, but max_batch is a reasonable bound to avoid an unbounded scan.
+    explain_pipeline = [
         {"$match": query},
         {"$sort": {field: ASCENDING}},
         {"$limit": max_batch},
@@ -559,7 +571,7 @@ def run_once(
         client,
         db_name=db_name,
         coll_name=coll_name,
-        pipeline=pipeline,
+        pipeline=explain_pipeline,
         repl_lag_hard_stop=repl_lag_hard_stop,
         dirty_scale_start=dirty_scale_start,
         dirty_hard_stop=dirty_hard_stop,

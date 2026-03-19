@@ -1,4 +1,4 @@
-# MongoDB Batch Deleter
+# mongottl
 
 TTL-style batch delete service for MongoDB. Runs continuously in default mode, deleting one batch of expired documents per cycle and sleeping between runs. Throttles the batch size based on real-time cluster health signals.
 

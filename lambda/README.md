@@ -1,4 +1,4 @@
-# MongoDB Batch Deleter — Lambda / EventBridge
+# mongottl — Lambda / EventBridge
 
 The same `main.py` used for the long-running service also serves as the Lambda entry point. When deployed to AWS Lambda, the runtime calls `handler(event, context)` directly. No separate Lambda file exists.
 
