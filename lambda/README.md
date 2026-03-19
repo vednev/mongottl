@@ -1,13 +1,25 @@
 # MongoDB Batch Deleter — Lambda / EventBridge
 
-Same TTL-style delete logic as the long-running service (`main.py`), adapted for AWS Lambda triggered by an Amazon EventBridge scheduled rule. Each invocation performs a single batch delete and exits. EventBridge handles the cadence.
+The same `main.py` used for the long-running service also serves as the Lambda entry point. When deployed to AWS Lambda, the runtime calls `handler(event, context)` directly. No separate Lambda file exists.
+
+---
+
+## How it differs from default mode
+
+| Concern | Default mode | Lambda mode |
+|---|---|---|
+| Config source | CLI arguments | Environment variables |
+| MongoDB URI | `--uri` flag | Fetched from Secrets Manager (`MONGO_SECRET_NAME`) |
+| MongoClient | Created fresh each run | Cached across warm invocations |
+| Scheduling | Caller's responsibility | EventBridge scheduled rule |
+| Return value | Logs result and exits | Returns result dict to Lambda runtime |
 
 ---
 
 ## Prerequisites
 
-- Python 3.11+ (Lambda runtime)
-- An AWS account with permissions to create Lambda functions, EventBridge rules, Secrets Manager secrets, and IAM roles
+- Python 3.11+ Lambda runtime
+- An Atlas project Group ID, public key, private key, and cluster name (sharded clusters only)
 - Your MongoDB URI stored in AWS Secrets Manager as:
   ```json
   { "uri": "mongodb+srv://user:pass@cluster.mongodb.net" }
@@ -27,11 +39,11 @@ aws secretsmanager create-secret \
 
 ### 2. Build the deployment package
 
-Lambda requires dependencies to be bundled with the code.
+Lambda requires all dependencies to be bundled with the code.
 
 ```bash
 pip install -r requirements.txt -t package/
-cp lambda.py package/
+cp main.py package/
 cd package && zip -r ../function.zip . && cd ..
 ```
 
@@ -68,28 +80,42 @@ aws iam put-role-policy \
 
 ### 4. Deploy the Lambda function
 
+The handler is `main.handler`.
+
 ```bash
 aws lambda create-function \
     --function-name mongo-batch-deleter \
     --runtime python3.11 \
     --role arn:aws:iam::<account-id>:role/mongo-batch-deleter-role \
-    --handler lambda.handler \
+    --handler main.handler \
     --zip-file fileb://function.zip \
     --timeout 900 \
     --environment Variables='{
-        "MONGO_SECRET_NAME": "mongo/batch-deleter",
-        "MONGO_DB": "mydb",
-        "MONGO_COLLECTION": "mycoll",
-        "MONGO_FIELD": "createdAt",
-        "MONGO_TTL_SECONDS": "2592000",
-        "MONGO_MAX_BATCH": "1000",
-        "MONGO_REPL_LAG_HARD_STOP": "200",
-        "MONGO_DIRTY_SCALE_START": "0.10",
-        "MONGO_DIRTY_HARD_STOP": "0.20"
+        "MONGO_SECRET_NAME":          "mongo/batch-deleter",
+        "MONGO_DB":                   "mydb",
+        "MONGO_COLLECTION":           "mycoll",
+        "MONGO_FIELD":                "createdAt",
+        "MONGO_TTL_SECONDS":          "2592000",
+        "MONGO_MAX_BATCH":            "1000",
+        "MONGO_REPL_LAG_HARD_STOP":   "200",
+        "MONGO_DIRTY_SCALE_START":    "0.10",
+        "MONGO_DIRTY_HARD_STOP":      "0.20"
     }'
 ```
 
-`--timeout 900` sets the maximum runtime to 15 minutes. Size this generously — a large delete batch can take several minutes.
+Add Atlas API variables if using a sharded cluster:
+
+```bash
+aws lambda update-function-configuration \
+    --function-name mongo-batch-deleter \
+    --environment Variables='{
+        ...,
+        "ATLAS_GROUP_ID":      "<24-hex-project-id>",
+        "ATLAS_PUBLIC_KEY":    "<public-key>",
+        "ATLAS_PRIVATE_KEY":   "<private-key>",
+        "ATLAS_CLUSTER_NAME":  "<cluster-name>"
+    }'
+```
 
 ### 5. Create the EventBridge scheduled rule
 
@@ -122,33 +148,42 @@ aws events put-targets \
 | `MONGO_COLLECTION` | yes | — | Collection name |
 | `MONGO_FIELD` | yes | — | Date field used for TTL comparison |
 | `MONGO_TTL_SECONDS` | yes | — | Retention period in seconds |
+| `ATLAS_GROUP_ID` | sharded only | — | Atlas project Group ID |
+| `ATLAS_PUBLIC_KEY` | sharded only | — | Atlas API public key |
+| `ATLAS_PRIVATE_KEY` | sharded only | — | Atlas API private key |
+| `ATLAS_CLUSTER_NAME` | sharded only | — | Atlas cluster name |
 | `MONGO_MAX_BATCH` | no | `1000` | Max documents to delete per invocation |
 | `MONGO_REPL_LAG_HARD_STOP` | no | `200` | Replication lag in seconds that triggers a hard stop |
 | `MONGO_DIRTY_SCALE_START` | no | `0.10` | Dirty cache ratio at which batch scaling begins |
 | `MONGO_DIRTY_HARD_STOP` | no | `0.20` | Dirty cache ratio at which batch scaling reaches zero |
+| `MONGO_DRY_RUN` | no | `false` | Set to `"true"` to skip actual deletes |
 
 ---
 
-## Throttling behaviour
-
-On each invocation the handler samples the same cluster health signals as `main.py`:
-
-**Hard stops** (invocation exits immediately, nothing deleted):
-- Replication lag > `MONGO_REPL_LAG_HARD_STOP` on any secondary
-- Write queue depth > 0
-
-**Gradual scaling**: batch size reduced linearly as dirty cache ratio rises between `MONGO_DIRTY_SCALE_START` and `MONGO_DIRTY_HARD_STOP`.
-
-On sharded clusters, metrics are sampled by connecting directly to each relevant shard primary (`directShardOperations` role required). On replica sets, metrics are sampled from the primary directly.
-
-The invocation return value is logged to CloudWatch:
+## Return values (logged to CloudWatch)
 
 | `status` | `reason` | Meaning |
 |---|---|---|
-| `skipped` | `hard_stop` | Cluster health hard stop triggered |
-| `skipped` | `nothing_eligible` | No documents older than TTL found |
-| `skipped` | `utilisation_too_high` | Dirty cache scaling reduced batch to zero |
+| `skipped` | `hard_stop` | A hard stop signal was active (repl lag, write queue, or disk queue) |
+| `skipped` | `utilization_too_high` | Gradual scaling reduced the batch to zero |
+| `skipped` | `nothing_eligible` | No documents older than the TTL cutoff were found |
+| `dry_run` | — | Dry run — documents counted but not deleted |
 | `ok` | — | Batch deleted successfully |
+
+---
+
+## Local testing
+
+Use `--lambda` to invoke the Lambda code path locally without deploying:
+
+```bash
+MONGO_SECRET_NAME=mongo/batch-deleter \
+MONGO_DB=mydb \
+MONGO_COLLECTION=mycoll \
+MONGO_FIELD=createdAt \
+MONGO_TTL_SECONDS=2592000 \
+python main.py --lambda
+```
 
 ---
 
@@ -156,7 +191,7 @@ The invocation return value is logged to CloudWatch:
 
 ```bash
 pip install -r requirements.txt -t package/
-cp lambda.py package/
+cp main.py package/
 cd package && zip -r ../function.zip . && cd ..
 aws lambda update-function-code \
     --function-name mongo-batch-deleter \
@@ -167,7 +202,7 @@ aws lambda update-function-code \
 
 ## Notes
 
-- The MongoDB client and URI are cached across warm Lambda invocations — a new connection is only established on a cold start.
-- An index on `MONGO_FIELD` is strongly recommended. The batch ID fetch filters and sorts on this field every invocation.
+- The MongoClient is cached across warm Lambda invocations. A new connection is established only on a cold start.
+- An index on `MONGO_FIELD` is strongly recommended.
 - EventBridge's minimum schedule frequency is 1 minute. If your backlog is large, increase `MONGO_MAX_BATCH` rather than invoking more frequently.
-- If MongoDB is inside a VPC, the Lambda function must be deployed into the same VPC with appropriate security group rules. Add `--vpc-config` to the `create-function` command accordingly.
+- If MongoDB is inside a VPC, deploy the Lambda function into the same VPC with appropriate security group rules. Add `--vpc-config` to the `create-function` command.
